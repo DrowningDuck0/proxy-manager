@@ -223,7 +223,10 @@ class ProxyManager:
             for i in range(30):
                 if self._check_port(self.proxy_port):
                     # 启动 cooldown 后台进程（自动管理空闲关闭）
-                    self._start_cooldown_daemon()
+                    try:
+                        self._start_cooldown_daemon()
+                    except Exception as ce:
+                        pass
                     return {"success": True, "message": "代理已启动"}
                 time.sleep(0.5)
 
