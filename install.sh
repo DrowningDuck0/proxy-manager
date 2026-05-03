@@ -27,9 +27,21 @@ fi
 if [ -f "$CLASH_DIR/mihomo" ] && [ -x "$CLASH_DIR/mihomo" ]; then
     echo "✅ clash 核心已就绪"
 else
-    echo "📥 下载 clash-meta 核心..."
+    echo "📥 下载 clash-meta 核心（可能需要几分钟，请耐心等待）..."
     mkdir -p "$CLASH_DIR"
-    if curl -sL --connect-timeout 10 "$MIMO_URL" -o /tmp/mihomo.gz 2>/dev/null && [ -s /tmp/mihomo.gz ]; then
+    # 多次重试下载（网络不稳定时有用）
+    DOWNLOAD_OK=false
+    for i in 1 2 3; do
+        echo "  尝试 $i/3..."
+        if curl -sL --connect-timeout 15 --max-time 120 "$MIMO_URL" -o /tmp/mihomo.gz 2>/dev/null && [ -s /tmp/mihomo.gz ]; then
+            DOWNLOAD_OK=true
+            break
+        fi
+        echo "  下载失败，5 秒后重试..."
+        sleep 5
+    done
+
+    if [ "$DOWNLOAD_OK" = true ]; then
         gunzip -f /tmp/mihomo.gz
         mv /tmp/mihomo "$CLASH_DIR/mihomo"
         chmod +x "$CLASH_DIR/mihomo"
@@ -38,6 +50,8 @@ else
         echo "  ❌ 下载失败（可能需要代理或手动下载）"
         echo "  请手动下载后放到: $CLASH_DIR/mihomo"
         echo "  下载地址: https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.24"
+        echo "  或使用代理下载（WSL 外有代理的话）:"
+        echo "  curl -sL --proxy http://你的代理地址:端口 \"$MIMO_URL\" -o clash/mihomo.gz && gunzip clash/mihomo.gz"
         rm -f /tmp/mihomo.gz
     fi
 fi
