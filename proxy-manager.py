@@ -534,59 +534,71 @@ class ProxyManager:
         if not self.is_running():
             return {"success": False, "message": "代理未运行"}
 
-        # 快速模式：检查缓存
-        if quick_mode:
-            cache = self._load_speed_cache()
-            if cache:
-                print(f"│ 使用缓存: {cache['fastest']} ({cache['fastest_latency']}ms) 来自 {int(time.time()-cache['timestamp'])}秒前")
-                fastest_name = cache['fastest']
-                fastest_delay = cache['fastest_latency']
-                # 仍然设到选择组
-                self._set_fastest_to_groups(fastest_name)
-                return {
-                    "success": True, "fastest": fastest_name, "fastest_latency": fastest_delay,
-                    "tested": cache['total_tested'], "total": cache['total_nodes'], "cached": True,
-                    "message": f"最快节点: {fastest_name} ({fastest_delay}ms)"
-                }
-            else:
-                print(f"│ 缓存过期或无缓存，重新测速")
+        # 设置测速锁，防止 cooldown 误杀
+        lock_path = os.path.join(LOCK_DIR, "speedtest.lock")
+        try:
+            with open(lock_path, "w") as f:
+                f.write(str(int(time.time())))
+        except Exception:
+            pass
 
-        nodes = self.get_all_proxies()
-        if not nodes:
-            return {"success": False, "message": "未找到可用节点"}
+        try:
+            # 快速模式：检查缓存
+            if quick_mode:
+                cache = self._load_speed_cache()
+                if cache:
+                    print(f"│ 使用缓存: {cache['fastest']} ({cache['fastest_latency']}ms) 来自 {int(time.time()-cache['timestamp'])}秒前")
+                    fastest_name = cache['fastest']
+                    fastest_delay = cache['fastest_latency']
+                    # 仍然设到选择组
+                    self._set_fastest_to_groups(fastest_name)
+                    return {
+                        "success": True, "fastest": fastest_name, "fastest_latency": fastest_delay,
+                        "tested": cache['total_tested'], "total": cache['total_nodes'], "cached": True,
+                        "message": f"最快节点: {fastest_name} ({fastest_delay}ms)"
+                    }
+                else:
+                    print(f"│ 缓存过期或无缓存，重新测速")
 
-        print(f"│ 节点数: {len(nodes)}，正在测速...")
+            nodes = self.get_all_proxies()
+            if not nodes:
+                return {"success": False, "message": "未找到可用节点"}
 
-        results = []
-        for i, name in enumerate(nodes):
-            delay = self.test_proxy_delay(name, timeout=3000)
-            if delay is not None and delay > 0:
-                results.append((name, delay))
-            if (i + 1) % 10 == 0 or i == len(nodes) - 1:
-                print(f"│ 进度: {i+1}/{len(nodes)} | 可用: {len(results)} 个")
+            print(f"│ 节点数: {len(nodes)}，正在测速...")
 
-        if not results:
-            return {"success": False, "message": "所有节点均超时"}
+            results = []
+            for i, name in enumerate(nodes):
+                delay = self.test_proxy_delay(name, timeout=3000)
+                if delay is not None and delay > 0:
+                    results.append((name, delay))
+                if (i + 1) % 10 == 0 or i == len(nodes) - 1:
+                    print(f"│ 进度: {i+1}/{len(nodes)} | 可用: {len(results)} 个")
 
-        results.sort(key=lambda x: x[1])
-        fastest_name, fastest_delay = results[0]
+            if not results:
+                return {"success": False, "message": "所有节点均超时"}
 
-        top5 = results[:5]
-        print(f"│ 最快 Top5:")
-        for n, d in top5:
-            print(f"│   ⚡ {n}: {d}ms")
+            results.sort(key=lambda x: x[1])
+            fastest_name, fastest_delay = results[0]
 
-        # 保存缓存
-        self._save_speed_cache(fastest_name, fastest_delay, results, len(nodes))
+            top5 = results[:5]
+            print(f"│ 最快 Top5:")
+            for n, d in top5:
+                print(f"│   ⚡ {n}: {d}ms")
 
-        # 设置到选择组
-        self._set_fastest_to_groups(fastest_name)
+            # 保存缓存
+            self._save_speed_cache(fastest_name, fastest_delay, results, len(nodes))
 
-        return {
-            "success": True, "fastest": fastest_name, "fastest_latency": fastest_delay,
-            "tested": len(results), "total": len(nodes), "cached": False,
-            "message": f"最快节点: {fastest_name} ({fastest_delay}ms)"
-        }
+            # 设置到选择组
+            self._set_fastest_to_groups(fastest_name)
+
+            return {
+                "success": True, "fastest": fastest_name, "fastest_latency": fastest_delay,
+                "tested": len(results), "total": len(nodes), "cached": False,
+                "message": f"最快节点: {fastest_name} ({fastest_delay}ms)"
+            }
+        finally:
+            # 无论何种方式退出，都清理测速锁
+            self._clear_speedtest_lock()
 
     def _set_fastest_to_groups(self, fastest_name):
         """将最快节点设置到所有可用的 Selector 选择组"""
@@ -609,6 +621,15 @@ class ProxyManager:
                     path = f"/proxies/{urllib.parse.quote(main_group, safe='')}"
                     self._api_request("PUT", path, data={"name": fastest_name})
                     print(f"│ ✅ 已设置 '{main_group}' → {fastest_name}")
+
+    def _clear_speedtest_lock(self):
+        """清理测速锁文件"""
+        lock_path = os.path.join(LOCK_DIR, "speedtest.lock")
+        try:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+        except Exception:
+            pass
 
     def _health_check_url(self, test_url, timeout):
         """对单个 URL 执行联通测试"""
@@ -751,18 +772,30 @@ class ProxyManager:
 
     def cooldown(self):
         """
-        延迟关闭模式：等待 30 秒后检查是否有 active task
-        - 无 task → 关闭 clash
-        - 有 task → 重置等待计时器（循环继续等）
+        延迟关闭模式：等待 30 秒后检查是否有 active task 或正在进行测速
+        - 有 task 或测速进行中 → 重置等待计时器
+        - 无活动且代理已停 → 退出
+        - 无活动且代理运行中 → 关闭 clash
         """
         print(f"🕒 等待 30 秒后自动关闭代理...")
         while True:
             time.sleep(30)
 
+            # 先检查代理是否还在运行
+            if not self.is_running():
+                print(f"🕒 代理已不在运行，cooldown 退出")
+                break
+
             # 检查 task 引用计数
             active = self._get_task_count()
             if active > 0:
                 print(f"🕒 仍有 {active} 个 task 正在运行，重置 30 秒等待...")
+                continue
+
+            # 检查是否正在测速（避免 speedtest 期间误杀）
+            lock_path = os.path.join(LOCK_DIR, "speedtest.lock")
+            if os.path.exists(lock_path):
+                print(f"🕒 正在测速中，跳过关闭，重置 30 秒等待...")
                 continue
 
             # 没有 task 运行，关闭 clash
