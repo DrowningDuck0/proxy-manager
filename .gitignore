@@ -17,9 +17,9 @@ Thumbs.db
 .DS_Store
 proxy-manager.skill
 
-# Geo 数据库（可下载更新）
-clash/GeoSite.dat
-clash/geoip.metadb
+# Geo 数据库可下载更新，但保留在仓库中避免 clone 后启动失败
+# clash/GeoSite.dat
+# clash/geoip.metadb
 
 # 本地覆盖配置（不提交）
 clash/override.yaml
