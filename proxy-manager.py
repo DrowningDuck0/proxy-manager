@@ -136,7 +136,7 @@ class ProxyManager:
                 "success": True,
                 "node_count": len(proxies),
                 "nodes": proxy_names[:20],  # 只显示前20个
-                "message": f"订阅更新成功，获取到 {len(proxies)} 个节点（如有 Clash 正在运行，需重启生效）"
+                "message": f"订阅更新成功，获取到 {len(proxies)} 个节点"
             }
 
         except Exception as e:
@@ -194,7 +194,7 @@ class ProxyManager:
         return {"success": True}
 
     def start(self):
-        """启动 clash 代理（独占锁防止并行冲突）"""
+        """启动 clash 代理（常驻服务），启动后自动部署 cooldown 后台进程"""
         if self.is_running():
             return {"success": True, "message": "代理已在运行中"}
 
@@ -222,6 +222,8 @@ class ProxyManager:
             # 等待代理就绪（延长时间到 30 次 × 0.5s = 15s）
             for i in range(30):
                 if self._check_port(self.proxy_port):
+                    # 启动 cooldown 后台进程（自动管理空闲关闭）
+                    self._start_cooldown_daemon()
                     return {"success": True, "message": "代理已启动"}
                 time.sleep(0.5)
 
@@ -231,6 +233,19 @@ class ProxyManager:
 
         except Exception as e:
             return {"success": False, "message": f"启动失败: {str(e)}"}
+
+    def _start_cooldown_daemon(self):
+        """启动后台 cooldown 进程（先杀掉旧进程）"""
+        cooldown_pidfile = os.path.join(LOCK_DIR, "cooldown.pid")
+        self._kill_process_by_pidfile(cooldown_pidfile)
+
+        cooldown_proc = subprocess.Popen(
+            [sys.executable, os.path.join(PROJECT_DIR, "proxy-manager.py"), "cooldown"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        with open(cooldown_pidfile, "w") as f:
+            f.write(str(cooldown_proc.pid))
 
     def stop(self):
         """关闭 clash 代理
@@ -384,52 +399,58 @@ class ProxyManager:
             except Exception:
                 pass
 
-    def _acquire_task_lock(self, timeout=30):
-        """获取 task 独占锁（proxy_in_use.lock），防止并行 task 冲突
-        阻塞等待最多 timeout 秒。返回文件描述符或 None。
-        """
+    def _increment_task_count(self):
+        """递增 task 引用计数，表示启动了一个 task"""
         os.makedirs(LOCK_DIR, exist_ok=True)
-        lock_path = os.path.join(LOCK_DIR, "proxy_in_use.lock")
+        count_path = os.path.join(LOCK_DIR, "task_count")
+        lock_fd = self._acquire_file_lock("task_count.lock", timeout=5)
         try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-            deadline = time.time() + timeout
-            while time.time() < deadline:
+            count = 0
+            if os.path.exists(count_path):
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    # 写入当前 PID
-                    os.ftruncate(fd, 0)
-                    os.write(fd, str(os.getpid()).encode())
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    return fd
-                except (IOError, OSError):
-                    # 读一下持有者的 PID
-                    try:
-                        os.lseek(fd, 0, os.SEEK_SET)
-                        holder_pid = os.read(fd, 32).decode().strip()
-                    except Exception:
-                        holder_pid = "unknown"
-                    print(f"⏳ 另一个任务正在使用代理 (PID: {holder_pid})，等待中...")
-                    time.sleep(2)
-            # 超时
-            os.close(fd)
-            return None
-        except Exception:
-            if fd is not None:
-                try:
-                    os.close(fd)
+                    with open(count_path) as f:
+                        count = int(f.read().strip() or "0")
                 except Exception:
-                    pass
-            return None
+                    count = 0
+            count += 1
+            with open(count_path, 'w') as f:
+                f.write(str(count))
+            return count
+        finally:
+            if lock_fd is not None:
+                self._release_file_lock(lock_fd)
 
-    def _release_task_lock(self, fd):
-        """释放 task 独占锁"""
-        if fd is not None:
-            try:
-                os.ftruncate(fd, 0)
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
-            except Exception:
-                pass
+    def _decrement_task_count(self):
+        """递减 task 引用计数，表示 task 结束"""
+        os.makedirs(LOCK_DIR, exist_ok=True)
+        count_path = os.path.join(LOCK_DIR, "task_count")
+        lock_fd = self._acquire_file_lock("task_count.lock", timeout=5)
+        try:
+            count = 0
+            if os.path.exists(count_path):
+                try:
+                    with open(count_path) as f:
+                        count = int(f.read().strip() or "0")
+                except Exception:
+                    count = 0
+            count = max(0, count - 1)
+            with open(count_path, 'w') as f:
+                f.write(str(count))
+            return count
+        finally:
+            if lock_fd is not None:
+                self._release_file_lock(lock_fd)
+
+    def _get_task_count(self):
+        """读取当前 task 引用计数"""
+        count_path = os.path.join(LOCK_DIR, "task_count")
+        if not os.path.exists(count_path):
+            return 0
+        try:
+            with open(count_path) as f:
+                return int(f.read().strip() or "0")
+        except Exception:
+            return 0
 
     def _get_log_path(self):
         """获取今天的日志文件路径"""
@@ -635,92 +656,41 @@ class ProxyManager:
             "latency_ms": None
         }
 
-    def task_wrapper(self, task_name, command, env_extras=None, skip_speedtest=False, full_speedtest=False):
+    def task_wrapper(self, task_name, command, env_extras=None):
         """
-        代理任务封装器 — 在一个输出块内完成 开启→测速→测试→执行→延迟关闭
+        代理任务封装器 — 只设置环境变量，执行命令，不操作 clash 生命周期。
+        clash 需已运行（由 start 命令管理）。
         """
         result = {
             "task": task_name,
             "status": "failed",
             "stdout": "",
             "stderr": "",
-            "proxy_log": []
         }
 
-        # 预留 task_lock_fd，后面释放
-        task_lock_fd = None
-
-        # 0. 获取 task 独占锁
-        os.makedirs(LOCK_DIR, exist_ok=True)
-        task_lock_fd = self._acquire_task_lock(timeout=30)
-        if task_lock_fd is None:
-            self._log(f"TASK: 无法获取代理锁（有其他任务正在占用）", "ERROR")
-            print(f"└─ ❌ 另一个任务正在使用代理，等待超时（30秒）")
+        # 0. 检查 clash 是否在运行
+        if not self.is_running():
+            self._log(f"TASK: 代理未运行，拒绝执行", "ERROR")
+            print(f"❌ 代理未运行，请先执行 `python3 proxy-manager.py start`")
+            result["error"] = "代理未运行"
             return result
 
-        # 1. 开启代理
+        # 1. 递增引用计数
         self._log(f"TASK: {task_name}", "TASK")
-        print(f"┌─ 🔒 开启代理 ──────────────────────────────")
-        start_result = self.start()
-        result["proxy_log"].append(f"启动代理: {start_result['message']}")
-        print(f"│ {start_result['message']}")
-        self._log(f"代理已启动")
-        if not start_result["success"]:
-            print(f"└─ ❌ 代理启动失败")
-            result["error"] = start_result.get("error", "未知错误")
-            self._release_task_lock(task_lock_fd)
-            return result
-
-        # 记录最快节点
-        fastest_node = None
-        fastest_latency = None
-
-        # 2. 自动测速 + 选最快节点
-        if not skip_speedtest:
-            print(f"├─ ⏱ 测速选优 ──────────────────────────────")
-            speed = self.select_fastest_node(quick_mode=not full_speedtest)
-            if speed["success"] and speed.get("fastest"):
-                print(f"│ ✅ {speed['message']}")
-                fastest_node = speed['fastest']
-                fastest_latency = speed['fastest_latency']
-                result["proxy_log"].append(f"最快节点: {fastest_node} ({fastest_latency}ms)")
-            else:
-                print(f"│ ⚠️ {speed.get('message', '测速失败，使用默认节点')}")
-
-        # 3. 联通测试
-        print(f"├─ 🔍 联通测试 ──────────────────────────────")
-        health = self.health_check()
-        result["proxy_log"].append(f"联通测试: {'成功' if health['success'] else '失败'} ({health.get('latency_ms', 'N/A')}ms)")
-        print(f"│ {'✅' if health['success'] else '❌'} 延迟: {health.get('latency_ms', 'N/A')}ms")
-
-        if not health["success"]:
-            print(f"├─ ⚠️ 联通失败，尝试重试...")
-            time.sleep(2)
-            health = self.health_check()
-            if not health["success"]:
-                print(f"└─ ❌ 联通测试最终失败")
-                self.stop()
-                result["error"] = health.get("error", "网络不可达")
-                self._release_task_lock(task_lock_fd)
-                return result
-
-        # 记录联通延迟为节点延迟的 fallback
-        if health.get("latency_ms") and fastest_latency is None:
-            pass  # 没有经过节点测速，但不影响功能
-
-        # 4. 执行任务
-        print(f"├─ 📦 执行: {task_name} ────────────────────")
-        self._log(f"任务执行: {task_name}")
-        env = os.environ.copy()
-        env["http_proxy"] = f"http://127.0.0.1:{self.proxy_port}"
-        env["https_proxy"] = f"http://127.0.0.1:{self.proxy_port}"
-        env["all_proxy"] = f"socks5://127.0.0.1:{self.proxy_port}"
-        env["no_proxy"] = "localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.cn"
-
-        if env_extras:
-            env.update(env_extras)
+        count = self._increment_task_count()
+        print(f"┌─ 📦 执行: {task_name} (active tasks: {count}) ──────")
 
         try:
+            # 2. 设置代理环境变量并执行命令
+            env = os.environ.copy()
+            env["http_proxy"] = f"http://127.0.0.1:{self.proxy_port}"
+            env["https_proxy"] = f"http://127.0.0.1:{self.proxy_port}"
+            env["all_proxy"] = f"socks5://127.0.0.1:{self.proxy_port}"
+            env["no_proxy"] = "localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.cn"
+
+            if env_extras:
+                env.update(env_extras)
+
             proc = subprocess.run(
                 command,
                 env=env,
@@ -765,34 +735,17 @@ class ProxyManager:
             result["error"] = str(e)
             print(f"│ ❌ 任务异常: {e}")
             self._log(f"任务异常: {e}")
-
-        # 5. 释放 task 锁，启动 cooldown 延迟关闭
-        self._release_task_lock(task_lock_fd)
-        print(f"├─ 🔒 延迟关闭 ──────────────────────────────")
-        print(f"│ 代理将在 30 秒无活动后自动关闭")
-        self._log(f"代理将在 30 秒无活动后自动关闭")
-
-        # 启动 cooldown 后台进程
-        cooldown_pidfile = os.path.join(LOCK_DIR, "cooldown.pid")
-        # 先杀掉旧的 cooldown 进程（如果有）
-        self._kill_process_by_pidfile(cooldown_pidfile)
-
-        cooldown_proc = subprocess.Popen(
-            [sys.executable, os.path.join(PROJECT_DIR, "proxy-manager.py"), "cooldown"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        # 记录 PID
-        with open(cooldown_pidfile, "w") as f:
-            f.write(str(cooldown_proc.pid))
+        finally:
+            # 3. 递减引用计数（始终执行）
+            count = self._decrement_task_count()
+            print(f"│ ℹ️  active tasks 剩余: {count}")
 
         print(f"└─ {'✅ 任务完成' if result['status'] == 'success' else '❌ 任务失败'} ─────────────")
-
         return result
 
     def cooldown(self):
         """
-        延迟关闭模式：等待 30 秒后检查是否有 task 在运行
+        延迟关闭模式：等待 30 秒后检查是否有 active task
         - 无 task → 关闭 clash
         - 有 task → 重置等待计时器（循环继续等）
         """
@@ -800,26 +753,10 @@ class ProxyManager:
         while True:
             time.sleep(30)
 
-            # 检查是否有 task 锁被持有
-            lock_path = os.path.join(LOCK_DIR, "proxy_in_use.lock")
-            lock_held = False
-            if os.path.exists(lock_path):
-                try:
-                    fd = os.open(lock_path, os.O_RDWR, 0o644)
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        # 能拿到锁 → 没有其他 task
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                    except (IOError, OSError):
-                        # 拿不到锁 → 有其他 task
-                        lock_held = True
-                    finally:
-                        os.close(fd)
-                except Exception:
-                    pass
-
-            if lock_held:
-                print(f"🕒 检测到其他 task 正在运行，重置 30 秒等待...")
+            # 检查 task 引用计数
+            active = self._get_task_count()
+            if active > 0:
+                print(f"🕒 仍有 {active} 个 task 正在运行，重置 30 秒等待...")
                 continue
 
             # 没有 task 运行，关闭 clash
@@ -848,14 +785,14 @@ def main():
         print("  status             查看代理状态与订阅健康状况")
         print("  url show           显示当前订阅 URL")
         print("  url set <URL>      设置/更换订阅 URL")
-        print("  update             更新订阅配置")
-        print("  start              手动启动代理")
-        print("  stop               手动停止代理")
+        print("  update             更新订阅配置（Clash 运行中时自动重启）")
+        print("  start              启动代理（常驻，含后台空闲关闭）")
+        print("  stop               停止代理")
         print("  test               联通测试")
         print("  speedtest          自动测速所有节点，选最快节点")
-        print("  task <name> <cmd>  执行代理任务（自动先测速选优）")
+        print("  task <name> <cmd>  在代理环境执行任务（需先 start）")
         print("                     示例: task pip-install pip install torch")
-        print("  cooldown           后台延迟关闭模式（由 task 自动启动）")
+        print("  cooldown           手动启动空闲关闭（30秒无 task 关代理）")
         print("  shutdown           立即关闭代理 + 停掉后台 cooldown")
         print("  help               显示此帮助")
         return
@@ -864,6 +801,7 @@ def main():
 
     if cmd == "help":
         print("可用指令: status, url <show|set>, update, start, stop, test, speedtest, task <name> <cmd>, cooldown, shutdown")
+        print("说明: task 命令需要代理已运行（先执行 start）")
 
     elif cmd == "status":
         print(f"代理状态: {'🟢 运行中' if manager.is_running() else '🔴 已停止'}")
@@ -895,9 +833,15 @@ def main():
             manager.set_subscription(sys.argv[3])
             print("✅ 订阅 URL 已更新")
             # 更新后自动拉取配置
+            was_running = manager.is_running()
             result = manager.update_subscription()
             if result["success"]:
                 print(f"✅ {result['message']}")
+                if was_running:
+                    print("🔄 Clash 正在运行，自动重启以加载新配置...")
+                    manager.stop()
+                    start_result = manager.start()
+                    print(f"{start_result['message']}")
             else:
                 print(f"❌ {result['error']}")
 
@@ -905,11 +849,17 @@ def main():
         if not manager.has_subscription():
             print("❌ 请先配置订阅 URL: python3 proxy-manager.py url set <URL>")
             return
+        was_running = manager.is_running()
         result = manager.update_subscription()
         if result["success"]:
             print(f"✅ {result['message']}")
             if "nodes" in result:
                 print(f"节点列表前20: {', '.join(result['nodes'])}")
+            if was_running:
+                print("🔄 Clash 正在运行，自动重启以加载新配置...")
+                manager.stop()
+                start_result = manager.start()
+                print(f"{start_result['message']}")
         else:
             print(f"❌ {result['error']}")
 
@@ -935,11 +885,13 @@ def main():
     elif cmd == "speedtest":
         force_full = "--full" in sys.argv
         print(f"┌─ ⏱ 自动测速选优 ──────────────────────────")
-        start_result = manager.start()
-        print(f"│ {start_result['message']}")
-        if not start_result["success"]:
-            print(f"└─ ❌ 启动失败")
-            return
+        if not manager.is_running():
+            print(f"│ ℹ️  代理未运行，正在启动...")
+            start_result = manager.start()
+            print(f"│ {start_result['message']}")
+            if not start_result["success"]:
+                print(f"└─ ❌ 启动失败")
+                return
         result = manager.select_fastest_node(quick_mode=not force_full)
         if result["success"]:
             print(f"│ ⚡ 最优: {result['fastest']} ({result['fastest_latency']}ms)")
@@ -950,29 +902,20 @@ def main():
             print(f"└─ ✅ 测速完成")
         else:
             print(f"└─ ❌ {result.get('message', '测速失败')}")
-        manager.stop()
-        print("代理已关闭")
+        # 不再停止 clash（常驻服务）
 
     elif cmd == "task":
-        # 检查 --full 标记（仅在 arg[2] 位置，避免误吃掉传给命令的参数）
-        use_full_speedtest = len(sys.argv) >= 3 and sys.argv[2] == "--full"
-        shift = 1 if use_full_speedtest else 0
-        args = sys.argv  # 保持原始 argv 用于错误提示
-
-        if len(sys.argv) < 4 + shift:
+        if len(sys.argv) < 4:
             print("用法: python3 proxy-manager.py task <任务名> <命令>")
             print("示例: python3 proxy-manager.py task 'pip install' 'pip install torch'")
-            print("选项: --full  强制全量重新测速（不走缓存）")
             return
-        task_name = sys.argv[2 + shift]
-        task_cmd = ' '.join(sys.argv[3 + shift:])
+        task_name = sys.argv[2]
+        task_cmd = ' '.join(sys.argv[3:])
         # 去掉外层引号
         if len(task_cmd) >= 2 and task_cmd[0] == task_cmd[-1] and task_cmd[0] in ('"', "'"):
             task_cmd = task_cmd[1:-1]
         cmd_list = shlex.split(task_cmd)
-        # --full 时全量重测；否则用 quick 模式（缓存生效则直接用缓存）
-        # use_full_speedtest=True 时跳过缓存做全量测速
-        result = manager.task_wrapper(task_name, cmd_list, skip_speedtest=False, full_speedtest=use_full_speedtest)
+        result = manager.task_wrapper(task_name, cmd_list)
         if result["status"] != "success":
             sys.exit(1)
 
