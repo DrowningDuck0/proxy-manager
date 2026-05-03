@@ -92,19 +92,45 @@ python3 proxy-manager.py task "clone model" "git clone https://huggingface.co/xx
 
 ## 可用指令
 
+### 安装与配置
+
 | 指令 | 说明 |
 |------|------|
-| `python3 proxy-manager.py status` | 查看代理状态与订阅健康 |
+| `bash install.sh` | 一键安装：Python 依赖 + clash 核心验证 + AI Skill 部署 |
+| `cp config.yaml.example config.yaml` | 创建配置文件 |
+| `python3 proxy-manager.py url set <URL>` | 设置/更换订阅 URL（自动拉取配置并重启 clash） |
 | `python3 proxy-manager.py url show` | 显示当前订阅 URL |
-| `python3 proxy-manager.py url set <URL>` | 设置/更换订阅 URL |
-| `python3 proxy-manager.py update` | 更新订阅配置 |
-| `python3 proxy-manager.py start` | 手动启动代理（自动部署后台 cooldown） |
-| `python3 proxy-manager.py stop` | 手动停止代理 |
-| `python3 proxy-manager.py speedtest` | 测速（缓存有效则直接用缓存） |
-| `python3 proxy-manager.py speedtest --full` | 强制全量重新测速 |
-| `python3 proxy-manager.py task <name> <cmd>` | 执行代理任务（需先 start） |
-| `python3 proxy-manager.py cooldown` | 手动启动延迟关闭模式 |
+
+### 代理生命周期
+
+| 指令 | 说明 |
+|------|------|
+| `python3 proxy-manager.py start` | 启动代理（常驻服务，自动部署后台 cooldown） |
+| `python3 proxy-manager.py stop` | 停止代理 |
+| `python3 proxy-manager.py cooldown` | 手动启动空闲关闭模式（30 秒无 task 自动停） |
 | `python3 proxy-manager.py shutdown` | 立即关闭代理 + 停掉后台 cooldown |
+
+### 管理与诊断
+
+| 指令 | 说明 |
+|------|------|
+| `python3 proxy-manager.py status` | 查看代理状态与订阅健康状况 |
+| `python3 proxy-manager.py test` | 联通测试（仅检测代理是否响应） |
+| `python3 proxy-manager.py update` | 更新订阅配置（运行中自动重启 clash） |
+| `python3 proxy-manager.py speedtest` | 自动测速，选最快节点（有缓存直接复用） |
+| `python3 proxy-manager.py speedtest --full` | 强制全量重新测速 |
+| `python3 proxy-manager.py task <name> <cmd>` | 在代理环境下执行命令（需先 start） |
+
+### 完整示例：首次配置
+
+```bash
+cd /mnt/i/openclawWS/proxy-manager
+bash install.sh
+cp config.yaml.example config.yaml
+# 编辑 config.yaml 填入订阅 URL
+python3 proxy-manager.py url set "https://your-subscription-url"
+python3 proxy-manager.py status
+```
 
 ## 权限规则
 
