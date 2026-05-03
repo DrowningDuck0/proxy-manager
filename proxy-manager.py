@@ -585,11 +585,11 @@ class ProxyManager:
         return {
             "success": True, "fastest": fastest_name, "fastest_latency": fastest_delay,
             "tested": len(results), "total": len(nodes), "cached": False,
-            "message": f"最快节点: {fastest_name} ({fastest_delay}ms)，已设为默认"
+            "message": f"最快节点: {fastest_name} ({fastest_delay}ms)"
         }
 
     def _set_fastest_to_groups(self, fastest_name):
-        """将最快节点设置到所有选择组"""
+        """将最快节点设置到所有可用的 Selector 选择组"""
         select_groups = self.get_select_groups()
         main_group = None
         for group in select_groups:
@@ -600,14 +600,15 @@ class ProxyManager:
             main_group = select_groups[0]
 
         if main_group:
-            path = f"/proxies/{urllib.parse.quote(main_group, safe='')}"
-            self._api_request("PUT", path, data={"name": fastest_name})
-            print(f"│ ✅ 已设置 '{main_group}' → {fastest_name}")
-
-        groups_to_set = [g for g in select_groups if "自动选择" in g or "负载均衡" in g]
-        for g in groups_to_set:
-            path = f"/proxies/{urllib.parse.quote(g, safe='')}"
-            self._api_request("PUT", path, data={"name": fastest_name})
+            # 检查该组是否允许设置（只有 Selector 类型的组才接受 PUT）
+            data = self._api_request("GET", "/proxies")
+            if data:
+                proxies = data.get("proxies", {})
+                group_info = proxies.get(main_group, {})
+                if group_info.get("type") == "Selector" and fastest_name in group_info.get("all", []):
+                    path = f"/proxies/{urllib.parse.quote(main_group, safe='')}"
+                    self._api_request("PUT", path, data={"name": fastest_name})
+                    print(f"│ ✅ 已设置 '{main_group}' → {fastest_name}")
 
     def _health_check_url(self, test_url, timeout):
         """对单个 URL 执行联通测试"""
