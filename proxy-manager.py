@@ -237,6 +237,8 @@ class ProxyManager:
     def _start_cooldown_daemon(self):
         """启动后台 cooldown 进程（先杀掉旧进程）"""
         cooldown_pidfile = os.path.join(LOCK_DIR, "cooldown.pid")
+        # 确保锁目录存在
+        os.makedirs(LOCK_DIR, exist_ok=True)
         self._kill_process_by_pidfile(cooldown_pidfile)
 
         cooldown_proc = subprocess.Popen(
