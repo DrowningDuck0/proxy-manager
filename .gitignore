@@ -17,8 +17,9 @@ Thumbs.db
 .DS_Store
 proxy-manager.skill
 
-# large binaries and databases (download on setup)
-clash/mihomo
+# Geo 数据库（可下载更新）
 clash/GeoSite.dat
 clash/geoip.metadb
+
+# 本地覆盖配置（不提交）
 clash/override.yaml
