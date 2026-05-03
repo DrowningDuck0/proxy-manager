@@ -1,0 +1,24 @@
+# secrets
+config.yaml
+
+# runtime artifacts
+__pycache__/
+*.pyc
+.locks/
+.checkpoints/
+logs/
+speed_cache.json
+
+# clash runtime
+clash/cache.db
+
+# OS files
+Thumbs.db
+.DS_Store
+proxy-manager.skill
+
+# large binaries and databases (download on setup)
+clash/mihomo
+clash/GeoSite.dat
+clash/geoip.metadb
+clash/override.yaml

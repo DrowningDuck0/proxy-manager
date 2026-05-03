@@ -1,0 +1,11 @@
+allowed_tasks: []
+api_port: 9090
+clash_binary: ./clash/mihomo
+health_check:
+  max_latency_ms: 3000
+  test_url: https://www.google.com
+  timeout_seconds: 5
+proxy_port: 7890
+subscription_update_interval: 60
+subscription_url: ""  # 替换为你的订阅 URL
+work_dir: ./clash
